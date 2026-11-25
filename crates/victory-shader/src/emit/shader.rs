@@ -407,6 +407,25 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.heap_handle_inner(block, index, sampler, nonuniform, props, nonuniform)
+    }
+
+    /// A buffer `getDimensions` handle emitted with `nonUniformIndex = true`
+    /// to avoid an AMD DXIL compiler crash (`amdxc64.dll+0x861b9f`) without
+    /// counting toward `nonuniform_handles` when the index itself is uniform.
+    pub fn heap_handle_for_buffer_dim(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        self.heap_handle_inner(block, index, false, true, props, false)
+    }
+
+    fn heap_handle_inner(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        count_nonuniform: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -435,7 +454,7 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
+        self.nonuniform_handles += u32::from(count_nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
