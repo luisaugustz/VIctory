@@ -11830,6 +11830,9 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // DXIL takes only the spatial coordinates. Leave the array slice undef.
+                let mut lod_coords = [fu; 3];
+                lod_coords[..spatial].copy_from_slice(&cs[..spatial]);
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -11838,7 +11841,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, lod_coords[0], lod_coords[1], lod_coords[2], clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -13927,7 +13930,7 @@ mod tests {
         lower_with(&words, layout(), used()).unwrap();
     }
 
-    /// Tables of 2D textures at s0 and samplers at s1.
+    /// Tables of textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
             kind,
@@ -13946,6 +13949,81 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn level_queries_leave_the_array_slice_undef() {
+        use crate::emit::{container::SigElement, validator::Validator};
+
+        let Some(path) = Validator::default_path() else {
+            eprintln!("no dxil.dll; DXIL validation skipped");
+            return;
+        };
+        let mut validator = Validator::load(Some(&path)).unwrap();
+        let mut errors = Vec::new();
+        let dimensions = [("1D", 0), ("2D", 1), ("3D", 2), ("1D array", 4), ("2D array", 5)];
+        for (name, dim) in dimensions {
+            let words = [
+                0xBE82_0300u32, // s_mov_b32 s2, s0 (texture table)
+                0xBE83_0380,    // s_mov_b32 s3, 0
+                0xF40C_0201, 0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], 0
+                0xBE82_0301, // s_mov_b32 s2, s1 (sampler table)
+                0xF408_0401, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[2:3], 0
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F2, // v_mov_b32 v1, 1.0
+                0x7E04_02F4, // v_mov_b32 v2, 2.0
+                0xF180_0300 | dim << 3, 0x0082_0300, // image_get_lod v[3:4], v0..., s[8:15], s[16:19]
+                0xF800_180F, 0x0403_0403, // exp mrt0, v3, v4, v3, v4 done vm
+                S_ENDPGM,
+            ];
+            let (layout, used) = texture_tables();
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 5,
+                layout,
+                used,
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let mut shader = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 15,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            if let Err(error) = validator.validate(&mut shader.dxil) {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
     #[test]
