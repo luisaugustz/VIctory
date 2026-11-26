@@ -405,9 +405,7 @@ impl CpuMeter {
             self.cores_pct.clear();
             let mut sum = 0.0f32;
             for (&(pi, pt), &(ni, nt)) in self.prev.iter().zip(&now) {
-                let dt = (nt - pt).max(1) as f32;
-                let di = (ni - pi).clamp(0, nt - pt) as f32;
-                let busy = ((1.0 - di / dt) * 100.0).clamp(0.0, 100.0);
+                let busy = busy_pct((pi, pt), (ni, nt));
                 self.cores_pct.push(busy);
                 sum += busy;
             }
@@ -928,6 +926,19 @@ impl Panel {
     }
 }
 
+/// How busy a core was between two reads of its (idle, kernel + user)
+/// counters, in percent. A core's counters can step back between two
+/// reads (seen on a Ryzen 7 7700): that reads as idle rather than making
+/// `clamp(0, negative)` panic on the submitting thread.
+fn busy_pct((pi, pt): (i64, i64), (ni, nt): (i64, i64)) -> f32 {
+    let span = nt - pt;
+    if span <= 0 {
+        return 0.0;
+    }
+    let di = (ni - pi).clamp(0, span) as f32;
+    ((1.0 - di / span as f32) * 100.0).clamp(0.0, 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,5 +1007,23 @@ mod tests {
         (a.0[1], b.0[1]) = (50, 20);
         let c = b.since(a, 10.0);
         assert_eq!((c[0], c[1]), (2.0, 2.0));
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::busy_pct;
+
+    #[test]
+    fn busy_is_the_share_of_time_not_idle() {
+        assert_eq!(busy_pct((0, 0), (25, 100)), 75.0);
+        assert_eq!(busy_pct((0, 0), (100, 100)), 0.0);
+    }
+
+    #[test]
+    fn counters_that_step_back_do_not_panic() {
+        assert_eq!(busy_pct((10, 156_250), (10, 0)), 0.0);
+        assert_eq!(busy_pct((500, 1_000), (400, 900)), 0.0);
+        assert_eq!(busy_pct((500, 1_000), (400, 1_100)), 100.0);
     }
 }
