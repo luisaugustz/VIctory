@@ -92,8 +92,11 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_PUSH=0` | the directory and the arenas are refreshed whole, through the write watch, for every list that reads memory by address, as before (on: what this module writes there is pushed at once, the dwords that changed) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
+| `VICTORY_BVH_SIZES_BOUND=0` | a structure's compacted size is not given a bound before the card's lands (on with the builder; Known gaps) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
@@ -114,7 +117,53 @@ dispatches, faults and what came.
   slot held before, another structure's size, and the copy wrote over the
   neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
   did not mend it and costs some 20 ms a frame (light-15): the title asks in
-  every frame, and what it read was as old as before. Open.
+  every frame, and what it read was as old as before.
+
+  Why the wait could not help (2026-11-26, from the code): the asking is the
+  builder's one-thread program `GetBVHCompactedSize`, recorded by
+  `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` (the only
+  build call the title imports). With `VICTORY_THIN=1` the list is translated
+  by threads of ours and sent by our line's thread (`queue/behind.rs`), and
+  the wait (`memory::asked_sizes`, `Host::send_late`) blocks that thread, not
+  the title's: the title goes on and reads the slot all the same. Nor can the
+  CPU know the size from the structure's header (dword 1): the builder writes
+  it on the card, in an arena, and it never comes to title memory.
+
+  Mended, untested in a run: **`VICTORY_BVH_SIZES_BOUND`** (on with the
+  builder; `0`: off), `crates/victory-gpu/src/bvhsize.rs`. The main image's
+  imports of the builder's `GetRaytracingAccelerationStructurePrebuildInfo`
+  and of the batched build go through `victory-hle`'s `modules/bvh.rs`
+  first. A prebuild answer (`ResultDataMaxSizeInBytes`, at least the
+  compacted size) is kept by what it depends on (kind, flags, counts and
+  formats of the inputs); a batched build's descriptions are looked through
+  for build descriptions (destination, then inputs) whose inputs were
+  answered (the batch's own description is not public: in place or pointed
+  at). When the size program is translated, its slot is given that bound in
+  title memory at once, so a read before the card's size lands takes memory
+  enough (more than it needs, until then). A bottom-of-pipe look on the
+  asking list (`Written::SizeLanded`) puts the latest bound back where an
+  earlier asking of the same slot landed after it. What is not found is left
+  as before. Every ten seconds the log says how many answers, structures
+  found, sizes asked with a bound and without, bounds put back.
+
+  The first run with it (bench bvh-bound1, 2026-11-26) ended in the title's
+  watchdog (`mov [0]` at +0x23cf683, 30 s after frame 1064 began), not in
+  anything the bound did: no bound was ever given (no size program had been
+  translated yet). The batches' bounds were right: 0x1cc00, the prebuild
+  answer, is the spacing of the title's own uncompacted destinations in the
+  same batch. What held the frame was the builder's first dispatch, which
+  made its 53 pipelines one after another on its thread: 8 s with a warm
+  driver cache in the next run (its frame 1053 took 13 s), about a second
+  each with a cold one, 40 made when the watchdog came. Now they are queued
+  for the workers when the title creates them, and all at once at that
+  first dispatch (`VICTORY_BVH_BUILDER_EARLY=0`: as before). A bound is
+  still more than the structure needs (0x1cc00 against some 0x13000 here):
+  the title takes that much of its pool for a structure whose size it reads
+  before the card's lands, which is the case that wrote over neighbours.
+  Making that read wait for the landing (the slot's page without access
+  until then) was not done: the page holds other slots and the title's
+  data, the layer writes it with the kernel's copies, and a wait on a title
+  thread for our line is the kind that ended this run.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame

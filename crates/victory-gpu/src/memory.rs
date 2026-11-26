@@ -227,6 +227,7 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
+        let _ = DIRECTORY.set(directory.clone());
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
@@ -421,6 +422,7 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                pushed_entry(self.entry(page));
             }
         }
         self.stats.gone += 1;
@@ -536,7 +538,11 @@ impl Memory {
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                let changed = merge(&title, ours, never);
+                if changed > 0 && push() {
+                    push_diff(shadow, held.at + piece, PIECE);
+                }
+                self.stats.changed += changed as u64 * 4;
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
@@ -646,7 +652,11 @@ impl Memory {
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+                if push() {
+                    push_diff(shadow, held.at + at, n);
+                } else {
+                    crate::watch::wrote(held.at + at, n);
+                }
             }
             at += n;
         }
@@ -744,9 +754,16 @@ impl Memory {
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
     fn bring_up(&self, list: &HostList) {
-        let (start, len) = self.directory.1.span();
-        self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        let push = push();
+        if !push {
+            let (start, len) = self.directory.1.span();
+            self.directory.1.refresh(list, start, len);
+        }
+        for (n, shadow) in self.copies.iter().enumerate() {
+            // (The arenas and the directory are pushed as they are written.)
+            if push && self.arenas.iter().any(|a| a.0 == n) {
+                continue;
+            }
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -814,6 +831,10 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// wrote over its neighbours: of 230 such copies of run light-11, 99 were
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
+///
+/// With `VICTORY_THIN=1` this wait is done by the thread of ours that sends
+/// submissions, not by the title's: the title goes on and reads the slot all
+/// the same. What mends it is a bound given at once (`crate::bvhsize`).
 fn sizes_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
@@ -853,6 +874,79 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
     unsafe {
         entry.add(1).write_volatile(offset as u32);
         entry.write_volatile(n as u32 + 1);
+    }
+    pushed_entry(entry);
+}
+
+/// The directory's copy, for [`pushed_entry`].
+static DIRECTORY: std::sync::OnceLock<Arc<Shadow>> = std::sync::OnceLock::new();
+
+/// Whether what this module writes into the directory and the arenas goes to
+/// the copies' CPU side at once, the dwords that changed, and is sent to the
+/// card with the next submission (`Shadow::resend`), instead of every list
+/// that reads memory by address refreshing them whole at its submission
+/// (`VICTORY_BVH_PUSH=0`: as before).
+///
+/// Those refreshes asked the kernel's write watch about 128 MB of directory
+/// and 64 MB an arena (some 700 MB in a dozen arenas in the world) for every
+/// such list: with ray tracing on, 7 ms more a frame in `GetWriteWatch` on the
+/// submitting thread (profiles rt-pon1 against rt-poff1, 2026-11-26), and
+/// more in what followed. Nothing but this module writes those two kinds of
+/// memory (shaders write the card's side, which never comes back), so it
+/// knows what changed without asking.
+fn push() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_PUSH").is_none_or(|v| v != "0"))
+}
+
+/// A directory entry was written: pushed ([`push`]).
+fn pushed_entry(entry: *mut u32) {
+    if !push() {
+        return;
+    }
+    if let Some(directory) = DIRECTORY.get() {
+        push_diff(directory, entry as usize, 8);
+    }
+}
+
+/// The dwords of our memory `[at, at + len)` (an arena's or the directory's,
+/// the copy `shadow` is of) that differ from the copy's CPU side go there and
+/// are sent to the card with the next submission; only those, so that what
+/// shaders stored on the card beside them stays (as the copy's refresh did,
+/// which sends only changes).
+fn push_diff(shadow: &Shadow, at: usize, len: usize) {
+    let (start, span) = shadow.span();
+    let (start, span) = (start as usize, span as usize);
+    let from = (at.max(start) - start) & !3;
+    let to = ((at + len).min(start + span) - start).next_multiple_of(4).min(span);
+    if from >= to {
+        return;
+    }
+    let data = shadow.card_data().cast_mut();
+    // SAFETY: inside our memory the copy is of and inside the copy's CPU-side
+    // mapping, both of the copy's length; under the module's mutex, and only
+    // this module writes either (the copy is not refreshed when pushing).
+    let (ours, theirs) = unsafe {
+        (
+            std::slice::from_raw_parts((start + from) as *const u8, to - from),
+            std::slice::from_raw_parts_mut(data.add(from), to - from),
+        )
+    };
+    if ours == theirs {
+        return;
+    }
+    let mut run: Option<usize> = None;
+    for i in (0..=ours.len()).step_by(4) {
+        let differs = i < ours.len() && ours[i..i + 4] != theirs[i..i + 4];
+        match (differs, run) {
+            (true, None) => run = Some(i),
+            (false, Some(s)) => {
+                theirs[s..i].copy_from_slice(&ours[s..i]);
+                shadow.resend(from + s, from + i);
+                run = None;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -925,6 +1019,16 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
+    }
+    // A compacted size asked for: the slot takes a bound at once
+    // (`crate::bvhsize`).
+    if builds
+        && asks_size(written, constants, threads)
+        && let [lo, hi, 1, ..] = *constants
+    {
+        let _bound = crate::bvhsize::asked(list, u64::from(lo) | u64::from(hi) << 32, written[0]);
+        #[cfg(feature = "diagnostics")]
+        m.trace.bound(frame, written[0], _bound);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -1116,7 +1220,9 @@ mod trace {
                 if now != was {
                     self.sizes.insert(structure, (now, frame));
                     gone.push(i);
-                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: {was:#x} -> {now:#x}"));
+                    // (A later asking's bound, put there by us.)
+                    let ours = if crate::bvhsize::bound_at(at) == Some(now) { " (a bound of ours)" } else { "" };
+                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: {was:#x} -> {now:#x}{ours}"));
                 } else if frame > then + 60 {
                     gone.push(i);
                     self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: still {was:#x}"));
@@ -1125,6 +1231,22 @@ mod trace {
             for i in gone.into_iter().rev() {
                 self.asked.swap_remove(i);
             }
+        }
+
+        /// The slot of the asking just traced was given `bound` in title
+        /// memory (`crate::bvhsize`): a change from it is what lands.
+        pub(super) fn bound(&mut self, frame: u64, at: u64, bound: Option<u64>) {
+            if !on() {
+                return;
+            }
+            let Some(bound) = bound else {
+                self.say(format!("frame {frame}: size at {at:#x}: no bound known"));
+                return;
+            };
+            if let Some(asked) = self.asked.iter_mut().rev().find(|a| a.1 == at) {
+                asked.3 = bound;
+            }
+            self.say(format!("frame {frame}: size at {at:#x}: given the bound {bound:#x}"));
         }
 
         pub(super) fn dispatch(
