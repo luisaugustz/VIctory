@@ -26,7 +26,7 @@ const GLYPH: (u32, u32) = (5, 7);
 
 /// Logical canvas dimensions (1x at <=1600p, 2x at 4K).
 const BASE_W: u32 = 540;
-const BASE_H: u32 = 334;
+const BASE_H: u32 = 354;
 
 /// How many recent frames the live frame-time graph keeps.
 const HISTORY: usize = 172;
@@ -467,6 +467,7 @@ struct Snapshot {
     max_ms: f64,
     draws: u64,
     dropped: u64,
+    building: u64,
     width: u32,
     height: u32,
     gpu_name: String,
@@ -638,7 +639,21 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     );
     c.text_sep(val_x, 308, 2, WHITE, &trunc(&ram_line, max_chars));
 
+    // Host pipelines
+    c.text(14, 328, 2, LABEL, "PIPES");
+    let (pipes_col, pipes_line) = pipelines_line(s.building);
+    c.text(val_x, 328, 2, pipes_col, &trunc(&pipes_line, max_chars));
+
     c
+}
+
+/// The panel's pipeline row: red while any host pipeline waits to be made.
+fn pipelines_line(building: u64) -> ([u8; 3], String) {
+    if building == 0 {
+        (GREEN, "PIPELINES OK".to_owned())
+    } else {
+        (RED, format!("BUILDING PIPELINES {building}"))
+    }
 }
 
 /// The buffers of a box that size and format.
@@ -704,6 +719,9 @@ pub(super) struct Panel {
     frames: u32,
     last: Instant,
     worst: f64,
+    /// The most host pipelines waiting to be made at any frame since the
+    /// last text: a short build between two texts still shows.
+    building: u64,
     /// What this took since the last text.
     cost: Duration,
     before: Counters,
@@ -724,6 +742,7 @@ impl Panel {
             frames: 0,
             last: now,
             worst: 0.0,
+            building: 0,
             cost: Duration::ZERO,
             before: Counters::default(),
             history: VecDeque::with_capacity(HISTORY),
@@ -761,6 +780,7 @@ impl Panel {
             self.last = now;
         }
         self.frames += 1;
+        self.building = self.building.max(crate::pipeline::making());
         let elapsed = now - self.since;
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
@@ -813,6 +833,7 @@ impl Panel {
             max_ms: self.worst,
             draws: c[10].round() as u64,
             dropped: c[8].round() as u64,
+            building: self.building,
             width: self.last_size.0,
             height: self.last_size.1,
             gpu_name: gpu_name.clone(),
@@ -834,7 +855,7 @@ impl Panel {
             history_ms: self.history.iter().copied().collect(),
         });
         self.changed = true;
-        (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        (self.since, self.frames, self.worst, self.building) = (now, 0, 0.0, 0);
         self.cost = now.elapsed();
     }
 
@@ -957,6 +978,12 @@ mod tests {
     }
 
     #[test]
+    fn the_pipeline_row_is_red_while_any_waits() {
+        assert_eq!(pipelines_line(0), (GREEN, "PIPELINES OK".to_owned()));
+        assert_eq!(pipelines_line(74), (RED, "BUILDING PIPELINES 74".to_owned()));
+    }
+
+    #[test]
     fn a_box_is_painted() {
         let snap = Snapshot {
             fps: 32.0,
@@ -968,6 +995,7 @@ mod tests {
             max_ms: 95.0,
             draws: 8903,
             dropped: 0,
+            building: 0,
             width: 2560,
             height: 1440,
             gpu_name: "AMD RADEON RX 9070 XT".into(),
