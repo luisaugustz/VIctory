@@ -7163,7 +7163,33 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // `VICTORY_SIZE_OWN_HANDLE=1`: a buffer's size through a handle of its
+        // own, from the same (uniform) heap index read from the first lane, so
+        // that AMD's compiler cannot merge it with the handle the buffer is
+        // read through; with one handle for both it crashes (`size_own_handle`).
+        // Not in pixel shaders: a helper lane's first-lane read is undefined.
+        let h = if super::size_own_handle()
+            && !self.s.pixel
+            && image.is_none()
+            && !self.x.res.waterfall.loads.contains(&site)
+        {
+            let index = self.heap_index(site, first, false)?;
+            let (index, bounded) = self.raw_twin(&src, index, false, props);
+            let i32t = self.s.t.i32;
+            self.s.flags |= flags::WAVE_OPS;
+            let index = self.s.op(
+                self.cur,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[index],
+            );
+            self.s
+                .heap_handle_at(self.cur, index, false, false, props, bounded)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
