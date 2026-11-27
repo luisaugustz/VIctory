@@ -16,11 +16,17 @@ a-publier `4eb6cfd`, plus:
   - `VICTORY_REAPER=1` (from Grimkaaah, after mgrein): no measurable gain here
   - `VICTORY_AMBIENT_REFLECT=<multiple>` (from maren-halv/VIctory-Fast): bounds RT-off reflections indoors; rooms look less washed out, shiny floors stay
 
+## Intro skip
+
+`VICTORY_SKIP_MOVIES=size=84828076` (GTA VI 1.0.2.1, Series X) skips the artwork and Rockstar logo movie that plays after the start screen: loading art appears about 3.5 s after the button press instead of about 16 s (one run each). `VICTORY_LOG_MOVIES=1` logs the name of every movie the title opens. Also sent upstream: https://github.com/Marvisak/VIctory/pull/3550
+
 ## Build
 
 ```
 cargo build --locked --release -p victory --features diagnostics
 ```
+
+Leave out `--features diagnostics` for the build to play with.
 
 ## Settings
 

@@ -1,5 +1,7 @@
 # VIctory on an RX 7900 XTX
 
+> This is a fork: the `belo-rx-v10` branch, tuned and measured on an RX 9070 XT. What is in it, how to build it and the settings used are in [PLAY.md](PLAY.md).
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 
