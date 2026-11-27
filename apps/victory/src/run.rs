@@ -188,6 +188,8 @@ pub fn run(
     if execute {
         // Structures' compacted sizes: the builder's calls seen on the way.
         victory_hle::modules::bvh::wrap_imports(image.base(), image.info());
+        // Movie opens, logged or some refused (VICTORY_LOG_MOVIES / VICTORY_SKIP_MOVIES).
+        victory_hle::modules::bink::wrap_imports(image.base(), image.info());
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
