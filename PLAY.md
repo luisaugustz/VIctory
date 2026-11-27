@@ -1,5 +1,7 @@
 # belo-rx-v10: how it is played
 
+Only for an RX 9070 XT with 32 GB of RAM or more on Adrenalin 26.11.2 (see [README.md](README.md)).
+
 Measured on an RX 9070 XT (Adrenalin 26.11.2), Ryzen 7 5800X, 32 GB, Windows 11, Series X, RT off.
 At the safehouse balcony (about 8,500 draws a frame): 18.5 fps median, p10 17.5, 54 ms a frame.
 The same spot on a-publier `4eb6cfd` + #477 was 13.0 fps.
