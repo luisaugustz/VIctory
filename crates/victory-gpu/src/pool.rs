@@ -388,6 +388,12 @@ impl Drop for StagingPiece {
 
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
+/// `VICTORY_STAGING_BAR=1`: staging blocks in resizable-BAR card memory (off by default).
+fn staging_bar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_BAR").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
     if !on() {
         return None;
@@ -401,7 +407,15 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        // `VICTORY_STAGING_BAR=1`: the block in the card's memory the CPU maps
+        // (resizable BAR) while the card is under 85 % of its budget, so that
+        // staging takes none of the PC's memory; else the PC's, as before.
+        let on_card = staging_bar()
+            && host.video_memory().is_none_or(|[budget, used, ..]| used + BLOCK <= budget / 100 * 85);
+        let (buffer, data) = on_card
+            .then(|| host.mapped_card_buffer(BLOCK, false))
+            .flatten()
+            .or_else(|| host.upload_buffer(BLOCK))?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;

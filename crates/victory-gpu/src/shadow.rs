@@ -512,6 +512,17 @@ fn window_mapped_most() -> u64 {
     })
 }
 
+/// How full the card may be (percent of its budget) for a window to go into
+/// its CPU-mapped memory ([`window_mapped_for`]).
+fn windows_bar_percent() -> u64 {
+    static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *P.get_or_init(|| bar_line(std::env::var("VICTORY_WINDOWS_BAR_PERCENT").ok().as_deref()))
+}
+
+fn bar_line(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |p| p.clamp(50, 97))
+}
+
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -523,8 +534,11 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
+    // `VICTORY_WINDOWS_BAR_PERCENT` (50 to 97; unset: 80): how full the card
+    // may be for a window to go there. Windows are read every frame; the
+    // texture cache that keeps the card near its line is not.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * windows_bar_percent()
     {
         return None;
     }
@@ -5721,9 +5735,18 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        WINDOW, bar_line, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
         tail_of, window_of, window_victims,
     };
+
+    #[test]
+    fn windows_go_to_the_card_below_eighty_percent_unless_set() {
+        assert_eq!(bar_line(None), 80);
+        assert_eq!(bar_line(Some("92")), 92);
+        assert_eq!(bar_line(Some("99")), 97);
+        assert_eq!(bar_line(Some("20")), 50);
+        assert_eq!(bar_line(Some("x")), 80);
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {

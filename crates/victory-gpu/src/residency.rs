@@ -121,7 +121,25 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
+/// `VICTORY_PRESSURE_PHYSICAL=1` (with `VICTORY_RESIDENCY=1`): pressure is free
+/// physical memory alone, on at 1.5 GiB, off again at 2.5 GiB. With a
+/// system-managed page file the commit headroom sits near the commit lines
+/// whatever is let go (the page file grows on demand), and most of this
+/// process's commit is the card's own memory, not resident (#333): the
+/// commit lines turned pressure on once in every run and never off.
+fn physical_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESSURE_PHYSICAL").is_some_and(|v| v == "1"))
+}
+
+fn next_pressure_physical(was: bool, physical: u64) -> bool {
+    if was { physical < 2560 * MIB } else { physical <= 1536 * MIB }
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    if physical_only() {
+        return next_pressure_physical(was, physical);
+    }
     if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
@@ -175,7 +193,8 @@ pub(crate) fn critical_commit() -> bool {
         return false;
     }
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    let floor = if physical_only() { 256 * MIB } else { 1536 * MIB };
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < floor
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
@@ -193,6 +212,14 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_pressure_turns_on_at_one_and_a_half_and_off_at_two_and_a_half_gib() {
+        assert!(!next_pressure_physical(false, 2000 * MIB));
+        assert!(next_pressure_physical(false, 1536 * MIB));
+        assert!(next_pressure_physical(true, 2000 * MIB));
+        assert!(!next_pressure_physical(true, 2560 * MIB));
+    }
 
     #[test]
     fn bake_and_lookahead_leave_room_for_live_game_allocations() {

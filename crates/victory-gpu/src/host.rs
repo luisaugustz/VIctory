@@ -173,13 +173,28 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(85) {
+    // `VICTORY_TEXTURE_KEEP_PERCENT=<p>` (40 to 85; unset: 85) moves all three
+    // lines down together. Every MB the card holds is also a MB of the PC's
+    // commit charge, so on PCs whose page file is small the cache's line is
+    // commit headroom (#333: at 75 % on an RTX 3090, ~2 GB less commit).
+    let k = keep_percent();
+    if used < share(k) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(93) {
-        (IDLE_MS, used - share(80))
+    } else if used < share(k + 8) {
+        (IDLE_MS, used - share(k - 5))
     } else {
-        (SHORT_MS, used - share(84))
+        (SHORT_MS, used - share(k - 1))
     }
+}
+
+/// The texture cache's "keep for minutes" line in percent of the card's budget.
+fn keep_percent() -> u64 {
+    static P: OnceLock<u64> = OnceLock::new();
+    *P.get_or_init(|| keep_line(std::env::var("VICTORY_TEXTURE_KEEP_PERCENT").ok().as_deref()))
+}
+
+fn keep_line(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(85, |p| p.clamp(40, 85))
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -234,6 +249,42 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
 fn wait_resident() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
+}
+
+/// Whether plain buffers wait too. `VICTORY_WAIT_RESIDENT=textures`: only
+/// texture blocks and textures (made with [`not_resident`] and named through
+/// slots that lists already sent may read) wait; buffers are made resident
+/// and are named only by lists recorded after they exist. On an RTX 3090 the
+/// buffers' waits were ~120,000 per 4 minutes (#346, #333).
+fn wait_resident_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| wait_resident() && buffers_wait(std::env::var("VICTORY_WAIT_RESIDENT").ok().as_deref()))
+}
+
+/// Whether a `VICTORY_WAIT_RESIDENT` setting leaves buffers waiting.
+fn buffers_wait(setting: Option<&str>) -> bool {
+    setting.is_none_or(|v| v.trim() != "textures")
+}
+
+/// [`not_resident`] for plain buffers.
+pub(crate) fn not_resident_buffer() -> D3D12_HEAP_FLAGS {
+    if wait_resident_buffers() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// [`resident`] for plain buffers.
+pub(crate) fn resident_buffer(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if !wait_resident_buffers() {
+        return Ok(());
+    }
+    resident(device, object)
+}
+
+/// [`mapped`] for plain buffers.
+pub(crate) fn mapped_buffer(device: &ID3D12Device) -> windows::core::Result<()> {
+    if !wait_resident_buffers() {
+        return Ok(());
+    }
+    mapped(device)
 }
 
 /// The flag memory is made with that [`resident`] waits for.
@@ -9190,7 +9241,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9198,7 +9249,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident_buffer(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10170,7 +10221,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10178,8 +10229,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident_buffer(&self.device, b)?;
+                    mapped_buffer(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10259,7 +10310,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10267,8 +10318,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident_buffer(&self.device, b)?;
+                    mapped_buffer(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10309,7 +10360,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                not_resident_buffer(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -10320,7 +10371,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident_buffer(&self.device, b))).and_then(|()| mapped_buffer(&self.device));
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -11413,6 +11464,38 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn the_keep_line_is_85_unless_set_lower() {
+        assert_eq!(super::keep_line(None), 85);
+        assert_eq!(super::keep_line(Some("75")), 75);
+        assert_eq!(super::keep_line(Some(" 60 ")), 60);
+        assert_eq!(super::keep_line(Some("95")), 85);
+        assert_eq!(super::keep_line(Some("10")), 40);
+        assert_eq!(super::keep_line(Some("most")), 85);
+    }
+
+    #[test]
+    fn the_default_keep_lines_are_as_before() {
+        // Unset, the lines are 85 / 93, trimming back to 80 and 84 %.
+        let gib = 1u64 << 30;
+        let budget = 100 * gib;
+        assert_eq!(super::vram_keep(budget, 84 * gib), (600_000, u64::MAX));
+        let (idle, most) = super::vram_keep(budget, 90 * gib);
+        assert_eq!(idle, 5_000);
+        assert_eq!(most, 90 * gib - budget / 100 * 80);
+        let (idle, most) = super::vram_keep(budget, 95 * gib);
+        assert_eq!(idle, 3_000);
+        assert_eq!(most, 95 * gib - budget / 100 * 84);
+    }
+
+    #[test]
+    fn buffers_wait_unless_only_textures_do() {
+        assert!(super::buffers_wait(None));
+        assert!(super::buffers_wait(Some("1")));
+        assert!(!super::buffers_wait(Some("textures")));
+        assert!(!super::buffers_wait(Some(" textures ")));
     }
 
     #[test]
